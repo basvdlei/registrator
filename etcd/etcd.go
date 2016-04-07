@@ -8,8 +8,11 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"time"
 
-	etcd2 "github.com/coreos/go-etcd/etcd"
+	"golang.org/x/net/context"
+
+	etcd2 "github.com/coreos/etcd/client"
 	"github.com/gliderlabs/registrator/bridge"
 	etcd "gopkg.in/coreos/go-etcd.v0/etcd"
 )
@@ -41,12 +44,18 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 		return &EtcdAdapter{client: etcd.NewClient(urls), path: uri.Path}
 	}
 
-	return &EtcdAdapter{client2: etcd2.NewClient(urls), path: uri.Path}
+	cfg := etcd2.Config{
+		Endpoints: urls,
+		// TODO Transport: etcd2.CancelableTransport{}
+	}
+	c, err := etcd2.New(cfg)
+
+	return &EtcdAdapter{client2: c, path: uri.Path}
 }
 
 type EtcdAdapter struct {
 	client  *etcd.Client
-	client2 *etcd2.Client
+	client2 etcd2.Client
 
 	path string
 }
@@ -59,8 +68,8 @@ func (r *EtcdAdapter) Ping() error {
 		rr := etcd.NewRawRequest("GET", "version", nil, nil)
 		_, err = r.client.SendRequest(rr)
 	} else {
-		rr := etcd2.NewRawRequest("GET", "version", nil, nil)
-		_, err = r.client2.SendRequest(rr)
+		kapi := etcd2.NewKeysAPI(r.client2)
+		_, err = kapi.Get(context.Background(), "/", &etcd2.GetOptions{})
 	}
 
 	if err != nil {
@@ -74,7 +83,10 @@ func (r *EtcdAdapter) syncEtcdCluster() {
 	if r.client != nil {
 		result = r.client.SyncCluster()
 	} else {
-		result = r.client2.SyncCluster()
+		err := r.client2.Sync(context.Background())
+		if err == nil {
+			result = true
+		}
 	}
 
 	if !result {
@@ -93,7 +105,8 @@ func (r *EtcdAdapter) Register(service *bridge.Service) error {
 	if r.client != nil {
 		_, err = r.client.Set(path, addr, uint64(service.TTL))
 	} else {
-		_, err = r.client2.Set(path, addr, uint64(service.TTL))
+		kapi := etcd2.NewKeysAPI(r.client2)
+		_, err = kapi.Set(context.Background(), path, addr, &etcd2.SetOptions{TTL: time.Duration(service.TTL) * time.Second})
 	}
 
 	if err != nil {
@@ -111,7 +124,8 @@ func (r *EtcdAdapter) Deregister(service *bridge.Service) error {
 	if r.client != nil {
 		_, err = r.client.Delete(path, false)
 	} else {
-		_, err = r.client2.Delete(path, false)
+		kapi := etcd2.NewKeysAPI(r.client2)
+		_, err = kapi.Delete(context.Background(), path, &etcd2.DeleteOptions{})
 	}
 
 	if err != nil {
