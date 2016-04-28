@@ -1,6 +1,9 @@
 package etcd
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"flag"
 	"io/ioutil"
 	"log"
 	"net"
@@ -17,6 +20,10 @@ import (
 	etcd "gopkg.in/coreos/go-etcd.v0/etcd"
 )
 
+var certFile = flag.String("etcd-cert-file", "", "identify HTTPS client using this SSL certificate file")
+var keyFile = flag.String("etcd-key-file", "", "identify HTTPS client using this SSL key file")
+var caFile = flag.String("etcd-ca-file", "", "verify certificates of HTTPS-enabled servers using this CA bundle")
+
 func init() {
 	bridge.Register(new(Factory), "etcd")
 }
@@ -24,14 +31,28 @@ func init() {
 type Factory struct{}
 
 func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
-	urls := make([]string, 0)
-	if uri.Host != "" {
-		urls = append(urls, "http://"+uri.Host)
-	} else {
-		urls = append(urls, "http://127.0.0.1:2379")
+	transport, err := createTransport()
+	if err != nil {
+		log.Fatal("etcd: error creating transport", err)
 	}
 
-	res, err := http.Get(urls[0] + "/version")
+	urls := make([]string, 0)
+
+	scheme := "http://"
+	if *caFile != "" || *certFile != "" {
+		scheme = "https://"
+	}
+
+	if uri.Host != "" {
+		urls = append(urls, scheme+uri.Host)
+	} else {
+		urls = append(urls, scheme+"127.0.0.1:2379")
+	}
+
+	c := http.Client{
+		Transport: transport,
+	}
+	res, err := c.Get(urls[0] + "/version")
 	if err != nil {
 		log.Fatal("etcd: error retrieving version", err)
 	}
@@ -45,12 +66,17 @@ func (f *Factory) New(uri *url.URL) bridge.RegistryAdapter {
 	}
 
 	cfg := etcd2.Config{
-		Endpoints: urls,
-		// TODO Transport: etcd2.CancelableTransport{}
+		Endpoints:               urls,
+		HeaderTimeoutPerRequest: time.Duration(3) * time.Second,
+		Transport:               transport,
 	}
-	c, err := etcd2.New(cfg)
 
-	return &EtcdAdapter{client2: c, path: uri.Path}
+	client2, err := etcd2.New(cfg)
+	if err != nil {
+		log.Fatal("etcd: no valid etcd client could be created", err)
+	}
+
+	return &EtcdAdapter{client2: client2, path: uri.Path}
 }
 
 type EtcdAdapter struct {
@@ -140,4 +166,44 @@ func (r *EtcdAdapter) Refresh(service *bridge.Service) error {
 
 func (r *EtcdAdapter) Services() ([]*bridge.Service, error) {
 	return []*bridge.Service{}, nil
+}
+
+func createTransport() (*http.Transport, error) {
+	var transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		Dial: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: false,
+	}
+
+	if *caFile != "" {
+		certBytes, err := ioutil.ReadFile(*caFile)
+		if err != nil {
+			return &http.Transport{}, err
+		}
+
+		caCertPool := x509.NewCertPool()
+		ok := caCertPool.AppendCertsFromPEM(certBytes)
+
+		if ok {
+			tlsConfig.RootCAs = caCertPool
+		}
+	}
+
+	if *certFile != "" && *keyFile != "" {
+		tlsCert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			return &http.Transport{}, err
+		}
+		tlsConfig.Certificates = []tls.Certificate{tlsCert}
+	}
+
+	transport.TLSClientConfig = tlsConfig
+	return transport, nil
 }
